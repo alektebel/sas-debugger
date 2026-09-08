@@ -1,0 +1,19 @@
+# One-off GGUF export (scripts/export_gguf.sh): merge the QLoRA adapter into
+# the fp16 base so llama.cpp can convert it. Run this once on any machine — a
+# GPU is not required; the merge of a 0.5B needs ~3 GB of RAM.
+#
+#   python3 -m venv .venv-export
+#   .venv-export/bin/pip install -r requirements-export.txt
+#
+# On a CPU-only box install the CPU torch wheel to avoid pulling ~3 GB of CUDA:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+transformers>=4.45
+peft>=0.12
+safetensors>=0.4
+huggingface_hub>=0.24
+
+# convert_hf_to_gguf.py (from the llama.cpp checkout) also wants:
+numpy>=1.26
+sentencepiece>=0.2
+protobuf>=4.25

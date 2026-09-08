@@ -110,6 +110,8 @@
   .verdict { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:center; }
   .verdict .lbl { font:400 11px/1 var(--mono); color:var(--muted); letter-spacing:.04em; text-transform:uppercase; }
   .chip { font:500 11.5px/1 var(--mono); padding:5px 8px; }
+  .mode { display:inline-flex; align-items:center; gap:6px; font:500 12px/1 var(--mono); }
+  .mode select { font:inherit; padding:5px 6px; border-radius:6px; }
   .chip.ok { background:var(--okbg); color:var(--ok); }
   .chip.bad { background:var(--badbg); color:var(--bad); }
   .chip.warn { background:var(--warnbg); color:var(--warn); }
@@ -189,6 +191,13 @@
         <button class="btn-primary" id="run">▶ Run localisation</button>
         <button class="btn-secondary" id="runfiles">Dry run · my files</button>
         <button class="btn-quiet" id="clear">Clear</button>
+        <label class="mode"><span>Engine</span>
+          <select id="mode">
+            <option value="scripted">Scripted reference trace</option>
+            <option value="model">SFT 0.5B via llama.cpp (CPU)</option>
+          </select>
+        </label>
+        <span id="backendPill" class="chip flat">backend: checking…</span>
       </div>
       <div class="est">bundled sample assets · src_basilea.egp + rep_lgd.egp + ciclos_sospechosos.xlsx<br>est. 6 min 40 s · 1,412 cycles · 6 samples/cycle</div>
       <div id="status">Ready. The bundled sample assets are pre-loaded if you don't pick files.</div>
@@ -210,6 +219,8 @@
 <script>
 const log = document.getElementById('log');
 const statusEl = document.getElementById('status');
+const modeSel = document.getElementById('mode');
+const backendPill = document.getElementById('backendPill');
 const runBtn = document.getElementById('run');
 const runFilesBtn = document.getElementById('runfiles');
 const clearBtn = document.getElementById('clear');
@@ -249,6 +260,15 @@ function handle(ev){
       statusEl.textContent = 'Debugging ' + ev.suspect_id + ' …';
       break;
     }
+    case 'backend':
+      append('reason', `<div class="body"><b>Engine</b>: ${esc(ev.backend)}`
+             + (ev.url ? ` @ <code>${esc(ev.url)}</code>` : '')
+             + ` — ${esc(ev.detail || '')}</div>`); break;
+    case 'error':
+      append('sql', `<div class="body"><b>Error</b> — ${esc(ev.text)}</div>`);
+      statusEl.textContent = 'Stopped — see the error above.';
+      runBtn.disabled = false; runFilesBtn.disabled = false;
+      break;
     case 'reason':
       append('reason', `<div class="body">${esc(ev.text)}</div>`); break;
     case 'extract': {
@@ -296,10 +316,25 @@ async function run(useFiles){
   document.getElementById('xlsxName').textContent = data.xlsx;
   statusEl.textContent = 'Loaded ' + data.src + ' + ' + data.rep + ' + ' + data.xlsx;
   if (es) es.close();
-  es = new EventSource('/api/debug/' + data.session_id);
+  es = new EventSource('/api/debug/' + data.session_id + '?mode=' + encodeURIComponent(modeSel.value));
   es.onmessage = (m)=>{ handle(JSON.parse(m.data)); };
   es.onerror = ()=>{ /* EventSource retries automatically; the server keeps it open */ };
 }
+
+async function probeBackend(){
+  try {
+    const r = await fetch('/api/backend');
+    const b = await r.json();
+    backendPill.textContent = b.healthy
+      ? 'llama.cpp up @ ' + b.llama_url
+      : 'llama.cpp down (scripted only)';
+    backendPill.className = 'chip ' + (b.healthy ? 'ok' : 'flat');
+    if (b.healthy) modeSel.value = 'model';
+  } catch (e) {
+    backendPill.textContent = 'backend probe failed';
+  }
+}
+probeBackend();
 
 runBtn.onclick = ()=> run(false);
 runFilesBtn.onclick = ()=> run(true);

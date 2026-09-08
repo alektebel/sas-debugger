@@ -1,0 +1,18 @@
+# CPU-only runtime (no GPU, no torch) — the 32 GB laptop/desktop path.
+# Generation is served by llama.cpp's `llama-server` over HTTP; slm/backends.py
+# talks to it with the stdlib `urllib`, so nothing here pulls in a model stack.
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements-cpu.txt
+#
+# Then: scripts/export_gguf.sh (one-off, needs requirements-export.txt)
+#       scripts/llama_server.sh  -> serves the GGUF
+#       scripts/eval_cpu.sh / scripts/app.sh
+#
+# Data generation (slm.episodes), the oracle (slm.oracle), the lineage builder
+# and the whole vendor/ layer are SQLite + stdlib and need nothing at all.
+
+# Demo web app (examples/app)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+openpyxl>=3.1               # reads/writes the .xlsx of suspect cycles
