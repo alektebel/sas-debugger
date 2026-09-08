@@ -81,7 +81,29 @@ watch the agent debug in real time — reasoning, key-table extractions,
 diagnostic SQL, oracle verdicts and the final localisation (streamed via SSE).
 Bundled samples are in `examples/app_assets/`.
 
-## Quickstart
+The **Engine** selector switches between the deterministic reference trace and
+the SFT'd 0.5B generating the SQL itself through llama.cpp; either way every
+query is executed against the real trap/clean databases and graded by the same
+oracle.
+
+## Quickstart — CPU only, no GPU (32 GB + llama.cpp)
+
+Training needs the GPU box; everything else does not. Full walkthrough,
+resource envelope and caveats: **[CPU_LLAMACPP.md](CPU_LLAMACPP.md)**.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-cpu.txt   # no torch
+
+PY=.venv-export/bin/python LLAMA_CPP=~/llama.cpp bash scripts/export_gguf.sh
+LLAMA_CPP=~/llama.cpp bash scripts/llama_server.sh          # serves Q8_0, ~1 GB RAM
+
+bash scripts/gen_data.sh                                    # SQLite + stdlib
+bash scripts/eval_cpu.sh                                    # eval through llama.cpp
+LLAMA_SERVER_URL=http://127.0.0.1:8080 bash scripts/app.sh  # demo, model in the loop
+python3 -m unittest discover -s tests                       # CPU-path tests
+```
+
+## Quickstart — GPU (training)
 
 ```bash
 python3 -m venv --system-site-packages .venv     # reuses a working CUDA torch
@@ -97,6 +119,9 @@ bash scripts/app.sh            # live-debug demo (optional)
 
 - Env: RTX 5060 Ti 16 GB (Blackwell, compute 12.0). **No vLLM** (Blackwell
   compatibility risk).
+- Generation is backend-pluggable (`slm/backends.py`): `llamacpp` (HTTP to
+  `llama-server`, CPU) or `transformers` (4-bit CUDA). Only `slm/train_sft.py`
+  still requires a GPU.
 - RegLLM prior art is vendored under `vendor/` with attribution headers; this
   project has no runtime dependency on RegLLM.
 - Synthetic data only — no real customer or bank data anywhere.

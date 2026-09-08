@@ -1,4 +1,7 @@
-# Training environment (SFT-first, QLoRA). Python 3.11 venv recommended.
+# Training environment (SFT-first, QLoRA) — needs a CUDA GPU.
+# CPU-only box with llama.cpp?  Use requirements-cpu.txt (+ requirements-export.txt
+# once, to build the GGUF).  See CPU_LLAMACPP.md.
+# Python 3.11 venv recommended.
 # torch 2.14+ wheels ship with CUDA 13 support (Blackwell sm_120) — install the
 # matching cuXXX wheel for your PATH, e.g.:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu130

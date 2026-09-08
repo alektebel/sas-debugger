@@ -3,6 +3,7 @@ __pycache__/
 *.py[c]
 *.egg-info/
 .venv/
+.venv-export/
 venv/
 
 # Agent harness config (not part of the shipped project)
@@ -17,6 +18,9 @@ data/*.db
 
 # Model checkpoints / training artifacts
 checkpoints/
+checkpoints/*/merged/
+checkpoints/*/gguf/
+*.gguf
 runs/
 *.safetensors
 *.bin

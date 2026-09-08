@@ -14,6 +14,11 @@ Metrics (per test episode, graded by the execution-verified oracle):
   localization_acc    — table + suspect columns match the planted defect.
   extraction_useful   — the extraction request is present and executable.
   overall_success     — all of: valid, catches, precise, localization correct.
+
+Generation goes through ``slm.backends`` so the same evaluation runs on the
+CUDA training box (``--backend transformers``) or on a CPU-only machine driving
+a ``llama-server`` (``--backend llamacpp``, the default when
+``LLAMA_SERVER_URL`` is set).  Everything else here is SQLite + stdlib.
 """
 
 from __future__ import annotations
@@ -22,8 +27,6 @@ import argparse
 import json
 import statistics
 from pathlib import Path
-
-import torch
 
 from vendor.defect_catalog import DEFECTS_BY_ID
 from vendor.generate_db import build_clean_conn, build_trap
@@ -85,7 +88,7 @@ def grade_episode(episode: dict, generated: str) -> dict:
         clean.close()
 
 
-def run_best_of_n(episodes: list[dict], tok, model, n: int, temperature: float,
+def run_best_of_n(episodes: list[dict], backend, n: int, temperature: float,
                   sample_limit: int | None = None) -> dict:
     """Sample ``n`` responses per episode and keep the highest-reward one.
 
@@ -103,8 +106,8 @@ def run_best_of_n(episodes: list[dict], tok, model, n: int, temperature: float,
         try:
             best, best_r = None, -1.0
             for _ in range(n):
-                g = generate(tok, model, ep["system"], ep["user"],
-                             do_sample=True, temperature=temperature)
+                g = backend.generate(ep["system"], ep["user"],
+                                     do_sample=True, temperature=temperature)
                 r = compute_reward(env, g)["reward"]
                 if r > best_r:
                     best_r, best = r, g
@@ -139,63 +142,35 @@ def summarize(results: list[dict]) -> dict:
     }
 
 
-def load_model(base_model: str, adapter_dir: str | None):
-    from slm.train_sft import load_4bit_model, load_tokenizer, CausalLMCollator
-    tok = load_tokenizer(base_model)
-    model = load_4bit_model(base_model)
-    if adapter_dir and adapter_dir not in ("none", "None", ""):
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, adapter_dir)
-        model = model.merge_and_unload() if False else model  # keep LoRA active
-    model.eval()
-    model.to("cuda")
-    return tok, model
+def build_backend(backend: str | None, base_model: str, adapter_dir: str | None,
+                  llama_url: str | None = None):
+    """Resolve the generation backend (see ``slm.backends``)."""
+    from slm.backends import make_backend
+    return make_backend(backend, base_model=base_model, adapter_dir=adapter_dir,
+                        llama_url=llama_url)
 
 
-def generate(tok, model, system: str, user: str, *, do_sample=False,
-             max_new_tokens: int = 256, temperature: float = 0.7):
-    if hasattr(tok, "apply_chat_template"):
-        prompt = tok.apply_chat_template(
-            [{"role": "system", "content": system},
-             {"role": "user", "content": user}],
-            tokenize=False, add_generation_prompt=True)
-    else:
-        prompt = f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-    inputs = tok(prompt, return_tensors="pt").to(model.device)
-    gen_kwargs = dict(
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tok.pad_token_id,
-        do_sample=do_sample,
-        temperature=temperature if do_sample else None,
-        repetition_penalty=1.05,
-    )
-    with torch.no_grad():
-        out = model.generate(**inputs, **gen_kwargs)
-    generated_tokens = out[0][inputs["input_ids"].shape[1]:]
-    return tok.decode(generated_tokens, skip_special_tokens=True)
-
-
-def run_split(episodes: list[dict], tok, model, do_sample=False) -> list[dict]:
+def run_split(episodes: list[dict], backend, do_sample=False) -> list[dict]:
     results = []
     for ep in episodes:
-        gen = generate(tok, model, ep["system"], ep["user"], do_sample=do_sample)
+        gen = backend.generate(ep["system"], ep["user"], do_sample=do_sample)
         results.append(grade_episode(ep, gen))
     return results
 
 
 def evaluate(test_jsonl: str, base_model: str, adapter_dir: str | None,
-             sample_limit: int | None = None) -> list[dict]:
+             sample_limit: int | None = None, backend: str | None = None,
+             llama_url: str | None = None) -> list[dict]:
     eps = [json.loads(l) for l in open(test_jsonl, encoding="utf-8") if l.strip()]
     eps = [e for e in eps if e["split"] == "test"]
     if sample_limit:
         eps = eps[:sample_limit]
     baseline = [grade_baseline(e) for e in eps]
-    tok, model = load_model(base_model, adapter_dir)
+    be = build_backend(backend, base_model, adapter_dir, llama_url)
     try:
-        model_res = run_split(eps, tok, model, do_sample=False)
+        model_res = run_split(eps, be, do_sample=False)
     finally:
-        del model
-        torch.cuda.empty_cache()
+        be.close()
     return {"episodes": eps, "baseline": baseline, "model": model_res}
 
 
@@ -209,6 +184,13 @@ def main():
     ap.add_argument("--best_of_n", type=int, default=0,
                     help="if >0, measure best-of-N selection (greedy eval skipped)")
     ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--backend", default=None,
+                    choices=["llamacpp", "transformers"],
+                    help="generation backend; defaults to $SLM_BACKEND, else "
+                         "llamacpp when $LLAMA_SERVER_URL is set")
+    ap.add_argument("--llama_url", default=None,
+                    help="llama-server base URL (default $LLAMA_SERVER_URL "
+                         "or http://127.0.0.1:8080)")
     args = ap.parse_args()
 
     eps = [json.loads(l) for l in open(args.test_jsonl, encoding="utf-8") if l.strip()]
@@ -217,12 +199,13 @@ def main():
         eps = eps[: args.sample_limit]
 
     baseline = summarize([grade_baseline(e) for e in eps])
-    tok, model = load_model(args.base_model, args.adapter)
+    be = build_backend(args.backend, args.base_model, args.adapter, args.llama_url)
     try:
         if args.best_of_n > 0:
-            bon = run_best_of_n(eps, tok, model, args.best_of_n, args.temperature)
+            bon = run_best_of_n(eps, be, args.best_of_n, args.temperature)
             out = {
                 "n": len(eps),
+                "backend": be.name,
                 "base_model": args.base_model,
                 "adapter": args.adapter,
                 "oracle_baseline": baseline,
@@ -230,17 +213,18 @@ def main():
                 "best_of_n_k": args.best_of_n,
             }
         else:
-            mod = summarize(run_split(eps, tok, model))
+            mod = summarize(run_split(eps, be))
             out = {
                 "n": len(eps),
+                "backend": be.name,
                 "base_model": args.base_model,
                 "adapter": args.adapter,
                 "oracle_baseline": baseline,
                 "model": mod,
             }
+        out["llama_server_errors"] = getattr(be, "server_errors", 0)
     finally:
-        del model
-        torch.cuda.empty_cache()
+        be.close()
 
     print(json.dumps(out, indent=2))
     if args.json_out:

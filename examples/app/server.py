@@ -16,7 +16,10 @@ import json
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, Request
+import os
+import sys
+
+from fastapi import FastAPI, File, UploadFile, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -49,6 +52,17 @@ def assets() -> dict:
             "xlsx": SAMPLE_XLS.name}
 
 
+@app.get("/api/backend")
+def backend_status() -> dict:
+    """Is a llama.cpp server reachable?  Drives the mode toggle in the UI."""
+    sys.path.insert(0, str(HERE))
+    from agent import llama_server_healthy
+    url = os.environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080")
+    ok, detail = llama_server_healthy(url)
+    return {"llama_url": url, "healthy": ok, "detail": detail,
+            "default_mode": "model" if ok else "scripted"}
+
+
 @app.post("/api/session")
 async def create_session(
     src: UploadFile | None = File(None),
@@ -75,15 +89,17 @@ async def create_session(
 
 
 @app.get("/api/debug/{sid}")
-def debug_stream(sid: str) -> StreamingResponse:
-    import sys
+def debug_stream(sid: str, mode: str = Query("scripted",
+                 pattern="^(scripted|model|auto)$")) -> StreamingResponse:
     sys.path.insert(0, str(HERE))
     from agent import run_agent
 
     sess = sessions[sid]
+    llama_url = os.environ.get("LLAMA_SERVER_URL")
 
     def gen():
-        for ev in run_agent(sess["src"], sess["rep"], sess["xlsx"]):
+        for ev in run_agent(sess["src"], sess["rep"], sess["xlsx"],
+                            mode=mode, llama_url=llama_url):
             yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream",
@@ -93,7 +109,6 @@ def debug_stream(sid: str) -> StreamingResponse:
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
     port = int(os.environ.get("PORT", "8010"))
     print(f"Open http://127.0.0.1:{port}  (sample assets: {SAMPLE_SRC.name}, "

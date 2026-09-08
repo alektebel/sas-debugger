@@ -39,6 +39,16 @@ the diagnostic SQL query it needs.
   2.14+cu130 already installed). GPU: RTX 5060 Ti 16 GB (Blackwell). Do NOT
   use vLLM on this GPU.
 
+## CPU-only / llama.cpp path
+
+Generation is backend-pluggable (`slm/backends.py`: `llamacpp` over HTTP to
+`llama-server`, or `transformers`). **Only `slm/train_sft.py` needs CUDA** —
+everything else (oracle, episode generation, lineage, reward, `vendor/`, the
+demo app) is SQLite + stdlib. Do not reintroduce a module-level `import torch`
+outside `train_sft.py`; `tests/test_cpu_llamacpp.py` asserts against it.
+Setup, scripts, resource envelope and the two llama-server failure modes we
+hit: `CPU_LLAMACPP.md`.
+
 ## Reference assets
 
 - SAS field-lineage parser (from-scratch): `~/Documents/Development/learn-stuff-from-scratch/sas-lineage-tool/`

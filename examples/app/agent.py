@@ -4,6 +4,13 @@ Yields a sequence of events (reason / extract / sql / verdict / localize /
 done) so the UI can render the agent's debug trace **in real time**.  Every SQL
 verdict is real: the agent runs the query against a genuine trap and clean
 database (the deep 8-table pipeline) and reports what the oracle finds.
+
+Two modes:
+  * ``scripted`` — the hard-coded reference pass below.  Pure Python + SQLite,
+    no model, no GPU; it always finds the deep bug because the steps are fixed.
+  * ``model``    — ``model_agent.run_model_agent``: the SFT'd 0.5B served by
+    llama.cpp on CPU actually generates the SQL, and the same oracle grades it.
+``auto`` picks ``model`` when a llama-server answers, else ``scripted``.
 """
 
 from __future__ import annotations
@@ -43,7 +50,46 @@ def _egp_lineage(path: str) -> dict:
     return manifest
 
 
-def run_agent(egp_src: str, egp_rep: str, xlsx_path: str) -> Iterator[dict]:
+def run_agent(egp_src: str, egp_rep: str, xlsx_path: str, *,
+              mode: str = "scripted", llama_url: str | None = None) -> Iterator[dict]:
+    """Dispatch to the scripted or the model-driven pass.
+
+    ``mode``: ``scripted`` | ``model`` | ``auto``.
+    """
+    if mode in ("model", "auto"):
+        from model_agent import run_model_agent
+        if mode == "model":
+            yield from run_model_agent(egp_src, egp_rep, xlsx_path,
+                                       llama_url=llama_url)
+            return
+        if llama_server_healthy(llama_url)[0]:
+            yield from run_model_agent(egp_src, egp_rep, xlsx_path,
+                                       llama_url=llama_url)
+            return
+        yield {"kind": "backend", "backend": "scripted",
+               "healthy": True,
+               "detail": "no llama-server reachable — falling back to the "
+                         "scripted reference trace"}
+    else:
+        yield {"kind": "backend", "backend": "scripted", "healthy": True,
+               "detail": "deterministic reference trace (no model in the loop)"}
+    yield from run_scripted_agent(egp_src, egp_rep, xlsx_path)
+
+
+def llama_server_healthy(llama_url: str | None = None) -> tuple[bool, str]:
+    """Probe llama-server without importing torch (see slm.backends)."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from slm.backends import DEFAULT_LLAMA_URL, LlamaCppBackend
+    except Exception as e:
+        return False, f"slm.backends unavailable: {e}"
+    url = llama_url or os.environ.get("LLAMA_SERVER_URL", DEFAULT_LLAMA_URL)
+    return LlamaCppBackend(url).health()
+
+
+def run_scripted_agent(egp_src: str, egp_rep: str, xlsx_path: str) -> Iterator[dict]:
     """Yield event dicts for the whole debug pass on the loaded files."""
     src = _egp_lineage(egp_src)
     rep = _egp_lineage(egp_rep)
