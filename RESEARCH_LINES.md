@@ -1,138 +1,158 @@
-# Research lines — from synthetic demo to real data at a financial entity
+# Research framework — local SAS-run Q&A and error hypotheses
 
-Status: proposal (2026-09). Scope: what the literature says about local agents that
-debug databases from natural-language complaints, where this repo stands against it,
-and at most three research lines to make it work on real SAS pipelines in a bank.
+Status: proposal, 2026-09. Supersedes the earlier cross-run (two-version diff) framing.
 
----
+## 0. Fixed decisions (scope)
 
-## 1. Where the repo actually is (verified in code)
-
-| Claim in README | What the code does | Consequence on real data |
+| Decision | Value | Why |
 |---|---|---|
-| "held-out success 0.70" | Gold `diagnostic_sql` **is** `defect.oracle_sql` verbatim (`slm/episodes.py:gold_trace`). Test split = same 67 defect classes, new seeds (`generate_episodes`). | The eval measures recall of 67 memorised templates, not diagnosis. A defect outside the catalog is out of distribution; expected performance is unknown and there is no reason to assume it is > 0. |
-| "best-of-N 0.90" | Candidates are ranked with `reward.compute_reward`, which runs them against the **planted** trap/clean DBs (`slm/evaluate.py:run_best_of_n`). | This is pass@6 with an oracle. In production there is no planted defect and no clean DB, so the selector does not exist. The deployable number is the greedy 0.70 — on in-distribution data. |
-| "discrepancy between two SAS-produced tables" | The task is *intra-table invariant violation on one row* (e.g. `ECL != PD*LGD*EAD`). There is no second run, no diff. | The real complaint ("these cycles differ between `src_basilea` and `rep_lgd`") is a **cross-run** problem; many real discrepancies do not violate any invariant (wrong cut-off date, wrong join key, stale FX table). |
-| "uploads `.egp` projects" | `.egp` is a fake zip with `manifest.json` (`examples/app/agent.py:_egp_lineage`); the model prompt uses a hard-coded schema/lineage (`model_agent.py:schema_text/lineage_text`, `slm/lineage.py:_LAYERS`). | The SAS code never reaches the model. Real `.egp` (zip of `project.xml` + embedded programs, macros, `%include`, WORK tables) is not parsed. |
-| "natural-language complaint" | Input is one suspect row; the 1k–100k-row Excel is not aggregated. | No complaint understanding, no set-level reasoning ("all RETAIL_HIP cycles after 202403"). |
-| single defect | Exactly one planted defect per episode. | Real incidents mix several causes and *legitimate* differences (versioned data cuts, methodology changes). |
+| Input | **One** SAS EG 8.6 run (`.egp` = zip of `project.xml` + code nodes; logs if saved) + its output tables | User scope; no second version to diff against |
+| Task | Answer questions about the DB and propose **error hypotheses**, each backed by an executed query | "¿Por qué X vale V?", "¿Dónde se pierden filas?", "¿Qué ciclos incumplen R?" |
+| Runtime | Local, **≤ 32 GB RAM**, CPU (llama.cpp) | Bank constraint; the 35B MoE left no headroom |
+| Model | `Qwen3.5-9B` Q4_K_M (~6 GB); `Qwen3.5-4B` fallback | Leaves ~20 GB for DuckDB/SASPy/OS |
+| Data access | SASPy (read-only user) → local DuckDB snapshot of the run's tables | Queries never hit prod; auditable |
+| Division of labour | Deterministic tools compute; model plans, hypothesises, explains | Small models are unreliable at long tool chains |
+| Training | None until §4 RL3 gate clears; GPUs (2×5060) only for later QLoRA → GGUF | Fine-tuning changes behaviour, not memory/speed |
 
-Net: the repo is a sound **execution-verifiable harness** (oracle, trap/clean,
-reward) wrapped around a task that is easier and differently shaped than the target.
-The harness idea is worth keeping; the task definition and the eval are not.
+**Known limit (by construction).** A single run can show *what happened*, not that
+it is *wrong*, unless the question or a rule supplies an expectation. The system
+must say so rather than guess.
 
-## 2. What the literature says (condensed)
+## 1. What the current repo contributes
 
-- **Complaint-driven diagnosis is a database problem first.** QFix (Wang, Meliou,
-  Wu, SIGMOD'17) takes a query log + complaints about wrong values and returns which
-  query introduced the error, with exact (MILP) and scalable approximations. Rain /
-  Reptile (Wu et al.) generalise "complaints" over aggregates and pipelines. DIFF
-  (Abuzaid et al., VLDB'19) explains *which attribute combination* separates two
-  sets of rows. None of these needs an LLM; all assume lineage/query history is known.
-- **LLM SQL debugging is hard even for larger models.** BIRD-CRITIC / SWE-SQL
-  (NeurIPS'25): Bird-Fixer (Qwen2.5-Coder-14B, agentic, trained) solves ~38% of real
-  PostgreSQL user issues. Spider 2.0-DBT / ELT-Bench: repository-level pipeline
-  repair is agentic, iterative, and execution-feedback driven.
-- **Small models + agentic RL work when the reward is executable.** 2025–26 text-to-SQL
-  work (Reward-SQL, ReToolSQL, SERL-SQL, AGRO-SQL) reports gains from GRPO with
-  execution rewards at 2–8B, with small absolute improvements at the ~4B scale.
-- **Lineage extraction from legacy code with LMs is feasible but imperfect**
-  (schema-lineage benchmarks 2025; COBOL business-rule extraction). SQL-level lineage
-  is well served by deterministic parsers (SQLGlot, LineageX); SAS DATA-step +
-  macro code is the gap.
-- Gap: I found **no** published work on SLM agents debugging SAS pipelines from
-  complaints. Confidence: medium (arXiv full text was not readable from this
-  environment; several 2026 papers were seen by title/abstract only).
+Reusable: execution-verified grading pattern (`slm/oracle.py`), llama.cpp backend
+(`slm/backends.py`), rule catalog (`vendor/defect_catalog.py` — intra-table
+invariants fit the single-run scope), SSE demo shell.
+Not evidence for this scope: the 0.70/0.90 figures (same 67 defect classes in
+train/test; best-of-N picks with the planted-defect oracle). Not present: real
+`.egp` parsing, real lineage, NL questions, retrieval, sufficiency control.
 
-Implication: the winning architecture in the literature is *deterministic core
-(lineage + execution + diff), model at the edges (intent, hypothesis ranking,
-SQL drafting, explanation)*. The repo does the reverse: the 0.5B model is asked to
-produce the whole diagnosis in one shot.
+## 2. Evaluation first (everything below is measured against this)
 
-## 3. Research lines (ordered; each has a kill criterion)
+**Bench-real (primary).** 30 → 100 real questions the analyst already solved. Each
+item stores: question, gold answer/hypothesis, **gold evidence set** (code nodes,
+log lines, tables/columns, confirming query), and whether more info was needed.
 
-### L1 — Deterministic localisation core: lineage DAG + first-divergence search
+**Bench-mut (secondary, scalable).** Mutate one SAS step (join key, `<`/`<=`,
+missing-value semantics, `NODUPKEY` key, stale period, `LENGTH` truncation), run,
+auto-generate a symptom question from the observed effect. Ground truth = mutated step.
+Split by operator and by project, never by seed only.
 
-**Hypothesis.** For cross-run discrepancies, most localisation can be done without a
-model: parse `.egp` → column-level lineage DAG; for the suspect keys, compare the two
-runs node by node in topological order; the first node where values diverge (within
-tolerance) is the culprit step; DIFF-style explanation over the suspect set gives the
-population pattern (segment, period, fusion flag).
+**Metrics.**
+- Answer: correct hypothesis (step + column), confirmed by an executed query.
+- Context: gold-evidence recall @ token budget (1k / 2k / 4k); tokens per turn.
+- Sufficiency: selective accuracy (accuracy vs. coverage curve), missed-info rate,
+  unnecessary tool calls.
+- Cost: wall-clock per question on the target CPU; peak RSS.
 
-**Work.**
-1. Real `.egp` reader (`project.xml` + code nodes) → SAS lineage via the existing
-   from-scratch parser / `alektebel/sas-lineage`; PROC SQL through SQLGlot.
-2. Snapshot strategy for intermediates: SAS `WORK` tables vanish at session end.
-   Either persist them (`options` + libname redirect in a debug run) or re-execute
-   the two projects under instrumentation. **This is the main technical risk.**
-3. First-divergence search (binary search over the DAG path when snapshots are
-   expensive) + DIFF over the Excel of suspect cycles.
+## 3. Reference loop
 
-**Measure.** Top-1/top-3 step localisation and time-to-diagnosis on historical,
-already-closed incidents from the team (even 20–30 is enough to start).
+```
+question
+  → anchor extraction        (tables, columns, keys, steps, periods, values)
+  → candidate retrieval      (lineage graph walk from anchors; log index by step;
+                              BM25/dense only over prose docs)
+  → trimming to budget       (RL1)
+  → reason → hypotheses      (model, working memory JSON)
+  → sufficiency gate         (RL2)  ── insufficient → tool call / ask user ─┐
+  → confirming query (DuckDB, read-only) → verdict                           │
+  → answer | abstain with "what is missing"  ←──────────────────────────────┘
+```
 
-**Kill / pivot.** If intermediates cannot be persisted or re-run with bank data
-under IT rules, cross-run localisation degrades to static reasoning over code and
-L1 alone is not viable — that finding is itself decisive for the project scope.
+Working memory = one JSON rewritten each turn: `{question, anchors, visited_steps,
+hypotheses[{claim, step, cols, query, verdict}], missing[]}`. Raw chat history is
+dropped. Per-turn budget ≈ 1k system/tools + 0.5k memory + 2k context + 0.5k last
+tool result.
 
-### L2 — Realistic benchmark: mutate the SAS code, not the rows
+## 4. Research lines
 
-**Hypothesis.** The target distribution is "two runs of the same pipeline differ
-because one step changed". It can be generated with ground truth by construction by
-applying mutation operators to the real SAS programs and running original vs mutant
-on masked or real data inside the bank.
+### RL1 — Context construction and trimming (GLiNER2.5 as candidate)
 
-**Operators (SAS-specific, from typical incidents).** Join key / `MERGE` without
-`IN=` or wrong `BY`; boundary `<` vs `<=` on dates/DPD; stale reference period or FX
-table; SAS missing-value semantics (`.` sorts below every number, so `x < 0.03`
-is true for missing); character truncation by `LENGTH`; `NODUPKEY` on the wrong key;
-units/sign/percent vs fraction; `FIRST./LAST.` logic; format/informat changes.
+Note: there is no "GLiNER 5.2"; the current release is **GLiNER2.5** (Fastino,
+Apache-2.0: small 74M, base 0.2B, multi 0.3B; schema-driven NER + classification +
+structured extraction, CPU-friendly).
 
-**Protocol.** Split by *operator* and by *pipeline* (never by seed only). Include
-multi-defect and "legitimate difference" episodes (answer = no bug). Replace the
-oracle-only selector with a **reference-free verifier** that also exists in
-production: apply the proposed fix to the localised step, re-run downstream, and
-check the complaint disappears for suspect keys and nothing else moves.
+**What GLiNER can and cannot do here.**
+- Good fit: **anchor extraction** from the question and from prose docs (table,
+  column, key, period, metric, business rule). Anchors drive the lineage graph walk,
+  which is the retrieval that matters for code and logs.
+- Weak fit: **query-conditioned relevance over a top-100**. GLiNER classifies text
+  against labels; relevance to a specific question is a pair task (cross-encoder /
+  pruner). Feeding `question + chunk` into GLiNER classification is possible but
+  off-design and untested.
+- Unknown: accuracy on SAS identifiers (`LGD_FINAL`, `WORK.T_L3`) — it was trained
+  on natural text. Must be measured, with an exact-match dictionary of schema names
+  as the baseline it has to beat.
 
-**Kill / pivot.** If the verifier cannot be run in production (no re-execution),
-best-of-N and GRPO have no deployable reward; stay with L1 + retrieval.
+**Arms (all on the same top-100 candidates, same budget).**
+1. Dictionary anchors + graph walk (no ML) — baseline.
+2. GLiNER2.5 anchors + graph walk.
+3. (2) + cross-encoder reranker (~0.6B) over top-100 → top-k.
+4. (2) + sentence-level pruner (Provence/XProvence style) → keep relevant sentences.
+5. (2) + GLiNER2.5 relevance classification over `question+chunk` (the user's idea).
 
-### L3 — Does a trained SLM earn its place? Ablation under the bank's envelope
+**Question.** Which arm maximises gold-evidence recall at 2k tokens with the lowest
+CPU cost, and does it move end-task accuracy?
+**Kill.** If arm 1 is within noise of the best arm, drop the ML trimming.
 
-**Hypothesis.** Given L1's core, an off-the-shelf 2–4B instruct model with a small
-tool set (`lineage(field)`, `diff(node, keys)`, `sample(node, keys)`,
-`run_sql(readonly)`) matches a fine-tuned 0.5B one-shot model on L2's held-out
-operators. Training is justified only for the residual gap.
+### RL2 — "Do we need more information?" (sufficiency control)
 
-**Arms.** (a) L1 alone + templated report; (b) + untrained 2–4B tool loop;
-(c) + SFT on L2 trajectories; (d) + GRPO with the L2 verifier as reward.
-Report success, cost per diagnosis, and wall-clock on the CPU/llama.cpp envelope.
+Evidence: adding retrieved context makes models *less* likely to abstain and more
+confident when wrong (Google, *Sufficient Context*, ICLR'25). Self-report alone is
+not a reliable gate.
 
-**Governance constraints to design in, not bolt on.** On-prem only; read-only
-credentials; the model sees schema, lineage and aggregated diffs by default, raw rows
-only on explicit extraction with masking; every query logged for audit; the output
-is a hypothesis for an analyst, not an automatic correction (keeps it out of scope
-for model-change processes that apply to regulatory calculations).
+**Arms.**
+1. **Deterministic checklist** (no model): for the asked field, are all lineage-path
+   nodes' code and log entries loaded? Does each hypothesis have an executed query?
+   Is there an expectation (value, rule, source) to judge "wrong"? Any "no" →
+   fetch or ask.
+2. **Model self-assessment**: explicit `need_more_info{what, why}` action before
+   answering.
+3. **Small sufficiency classifier** (the "intervention model" idea): scores
+   `(question, context)` as sufficient/insufficient; could be GLiNER2.5
+   classification or a fine-tuned small encoder — ties back to RL1.
+4. Combination: checklist as hard gate, (2)/(3) as soft signal.
 
-**Kill.** If (b) ≥ (c) within noise, drop fine-tuning entirely — leaner and easier to
-validate internally.
+Actions when insufficient: fetch (graph neighbour, log step, profile query) or ask
+the user a single targeted question (typically: the expectation).
+**Question.** Which gate gives the best selective-accuracy curve at the lowest
+number of tool calls?
+**Kill.** If the checklist alone matches (4), keep it — auditable and free.
 
-## 4. What to reuse from the repo
+### RL3 — Does fine-tuning earn its place?
 
-Keep: execution-verifiable grading (`slm/oracle.py` pattern), trap/clean harness idea,
-llama.cpp backend (`slm/backends.py`), SSE demo shell. Retire as evidence: the 0.70 /
-0.90 figures (in-distribution, oracle-selected). Rewrite: `slm/episodes.py` task
-definition (cross-run, set-level, code-mutation ground truth) and `slm/lineage.py`
-(real parsed lineage instead of `_LAYERS`).
+Arms: 9B base + RL1/RL2 best; 4B base + same; 9B QLoRA distilled from verified
+trajectories (teacher: larger model on the GPU box; keep only trajectories whose
+confirming query passes). Export to GGUF, re-measure on CPU.
+**Gate.** Train only if base 9B < ~60–70% on Bench-real *and* the failures are
+behavioural (tool-use format, hypothesis quality), not missing context (→ RL1) or
+missing expectations (→ RL2).
+
+## 5. Order and milestones
+
+1. SASPy connectivity spike on EG 8.6's SAS server (read-only user). Blocker check.
+2. `.egp` reader + lineage graph + log index by step; measure parser coverage
+   (% of steps/columns resolved; macros, `%include`, dynamic code).
+3. Bench-real v0 (30 items) + Bench-mut generator.
+4. RL1 and RL2 in parallel on Bench-real v0.
+5. RL3 only if the gate clears.
+
+## 6. Open questions (answers change the design)
+
+- Do the saved `.egp` files include logs? If not, can the run be re-executed to capture them?
+- Typical table volume (10^4 / 10^6 / 10^8 rows) → DuckDB snapshot feasibility.
+- Is there written methodology / business rules, or is the code the only spec?
+- Same 32 GB machine for model + SAS client, or separate?
 
 ## Sources
 
-- QFix — https://arxiv.org/abs/1601.07539
-- Complaint-driven training data debugging (Rain) — https://arxiv.org/pdf/2004.05722
-- DIFF — http://www.vldb.org/pvldb/vol12/p419-abuzaid.pdf
+- GLiNER2.5 — https://fastino.ai/blog/gliner2-5-span-free-information-extraction ;
+  GLiNER2 — https://arxiv.org/html/2507.18546v1 , https://github.com/fastino-ai/GLiNER2
+- Sufficient Context (ICLR'25) — https://arxiv.org/abs/2411.06037
+- Provence / XProvence context pruning — https://arxiv.org/pdf/2601.18886
+- Information Gain Pruning — https://arxiv.org/abs/2601.17532
+- QFix (complaint-driven diagnosis) — https://arxiv.org/abs/1601.07539
 - SWE-SQL / BIRD-CRITIC — https://arxiv.org/abs/2506.18951
-- Spider 2.0 — https://arxiv.org/pdf/2411.07763 ; ELT-Bench — https://arxiv.org/pdf/2504.04808
-- Reward-SQL — https://arxiv.org/html/2505.04671 ; ReToolSQL — https://arxiv.org/pdf/2608.27796 ;
-  SERL-SQL — https://arxiv.org/html/2608.00485 ; AGRO-SQL — https://arxiv.org/pdf/2512.23366
-- Schema lineage extraction benchmarks — https://arxiv.org/pdf/2508.07179 ;
-  LineageX — https://arxiv.org/pdf/2505.23133
+- SASPy — https://sassoftware.github.io/saspy/ ; SAS MCP servers —
+  https://github.com/sassoftware/sas-mcp-server , https://pypi.org/project/sas-mcp/0.1.0/
+- Qwen3.5 small models — https://artificialanalysis.ai/articles/qwen3-5-small-models
