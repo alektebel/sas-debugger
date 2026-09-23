@@ -18,6 +18,11 @@ the diagnostic SQL query it needs.
   `checkpoints/sft-0.5b/` (adapter in `lora/`); held-out success ≈ 0.70 greedy,
   0.90 with best-of-N. Stage-2 GRPO is **prepared but gated** (not launched).
 
+- **Direction change (2026-09):** scope is now Q&A + error hypotheses over a *single*
+  SAS EG 8.6 run, local ≤32 GB, deterministic core + 9B model. The synthetic SFT
+  numbers above are not evidence for that scope. Plan, decisions and research
+  lines: `RESEARCH_LINES.md`.
+
 ## Post-training pipeline (rerunnable)
 
 - `vendor/` — RegLLM prior art vendored (defect catalog, DB generator, expr
